@@ -16,7 +16,9 @@
 package io.micrometer.jetty11;
 
 import io.micrometer.core.instrument.MockClock;
+import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.binder.http.HttpRequestTags;
 import io.micrometer.core.instrument.binder.http.Outcome;
 import io.micrometer.core.instrument.simple.SimpleConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -413,6 +415,53 @@ class TimedHandlerTest {
 
         Thread.sleep(delay);
         assertTrue(shutdown.isDone());
+    }
+
+    @Test
+    void testRequestCustomTagsProvider() throws Exception {
+        CyclicBarrier[] barrier = { new CyclicBarrier(3), new CyclicBarrier(3) };
+        TimedHandler timedHandler = new TimedHandler(registry, Tags.empty(),
+            (request, response) -> Tags.of(
+                Tag.of("path", request.getPathInfo()),
+                HttpRequestTags.method(request),
+                HttpRequestTags.status(response),
+                HttpRequestTags.outcome(response)));
+        latchHandler.reset(2);
+
+        timedHandler.setHandler(new AbstractHandler() {
+            @Override
+            public void handle(String path, Request request, HttpServletRequest httpRequest,
+                HttpServletResponse httpResponse) throws IOException {
+                request.setHandled(true);
+                try {
+                    barrier[0].await(5, TimeUnit.SECONDS);
+                    barrier[1].await(5, TimeUnit.SECONDS);
+                }
+                catch (Exception x) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(x);
+                }
+            }
+        });
+        server.start();
+
+        String request = "GET / HTTP/1.1\r\n" + "Host: localhost\r\n" + "\r\n";
+        connector.executeRequest(request);
+        connector.executeRequest(request);
+
+        barrier[0].await(5, TimeUnit.SECONDS);
+        assertThat(registry.get("jetty.server.dispatches.open").longTaskTimer().activeTasks()).isEqualTo(2);
+
+        barrier[1].await(5, TimeUnit.SECONDS);
+        assertTrue(latchHandler.await());
+
+        assertThat(registry.get("jetty.server.requests")
+            .tag("outcome", Outcome.SUCCESS.name())
+            .tag("method", "GET")
+            .tag("status", "200")
+            .tag("path", "/")
+            .timer()
+            .count()).isEqualTo(2);
     }
 
     private static class LatchHandler extends HandlerWrapper {
